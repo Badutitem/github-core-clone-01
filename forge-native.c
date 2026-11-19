@@ -1603,6 +1603,8 @@ typedef struct Conn {
   size_t resp_head_len;  // relay backend: response head length once parsed
   size_t resp_scan;      // framing 2: chunk parser offset
   int dead;
+  uint32_t ev_mask;      // RONDE 6: last epoll mask successfully registered
+  int ev_known;          // RONDE 6: ev_mask reflects a live registration
 } Conn;
 
 // Worker model (OPTIMASI LEWAT BATAS, lever 1): up to MAX_WORKERS server threads,
@@ -1642,7 +1644,7 @@ static int g_cfg_quickack = 1;  // FORGE_QUICKACK (0/1)
 static int g_cfg_quickack_recv = 0;  // FORGE_QUICKACK_RECV (0/1/2): re-set TCP_QUICKACK after a successful recv — 0 = never (DEFAULT since RONDE 2: A/B pod won total 5/7 pairs vs always, clone best; the audit counted exactly 1 setsockopt per recv on every workload), 1 = always (pre-RONDE-2 behavior), 2 = smart: only while the buffered request is still incomplete. Accept-time set is governed by FORGE_QUICKACK alone.
 static int g_cfg_waitall = 1;        // FORGE_WAITALL (0/1): body-completion recv (MSG_WAITALL sized to the missing bytes) in the blocking loop — DEFAULT ON since RONDE 2 (A/B pod: faster paired 4/4 workloads vs off; git POSTs arrive in 2 segments = 2 recvs, audit counted +94 recvs over the clone phase)
 static int g_cfg_busy_poll_us = 0;   // FORGE_BUSY_POLL_US (0=off): SO_BUSY_POLL on accepted sockets
-static int g_cfg_model = 1;     // FORGE_NATIVE_MODEL: 1 = blocking thread-per-connection (DEFAULT since PENGGALIAN CELAH 2: won the standard-ruler per-workload A/B vs epoll), 0 = epoll workers (FORGE_NATIVE_MODEL=epoll)
+static int g_cfg_model = 0;     // FORGE_NATIVE_MODEL: 0 = epoll workers (DEFAULT since RONDE 6 in exp6: pure event-loop core, FORGE_NATIVE_THREADS loops with SO_REUSEPORT listeners, zero per-connection spawn), 1 = blocking thread-per-connection (FORGE_NATIVE_MODEL=blocking; the exp3/exp5 shipped model, kept as the control arm)
 static int g_cfg_stpool = 0;    // FORGE_NATIVE_STPOOL (0=off, else N standing connection-affinity workers; RONDE 3 lever 1)
 static int g_cfg_blk_spin_us = 0;      // FORGE_BLK_SPIN_US (0=off): adaptive spin before the blocking recv (RONDE 3 lever 2)
 static int g_cfg_blk_spin_maxconn = 4; // FORGE_BLK_SPIN_MAXCONN: spin only while blocking serves in flight <= this
@@ -1746,8 +1748,16 @@ static void epoll_mod(Conn *c) {
     if (c->out.len > 0) ev |= EPOLLOUT;
   }
   ev |= EPOLLRDHUP;
+  // RONDE 6 (forensic defect D1): the pre-RONDE-6 loop issued this epoll_ctl
+  // unconditionally after every event batch, although the desired mask almost
+  // never changes (a flushed native connection returns to EPOLLIN|EPOLLRDHUP
+  // every time). Skip the syscall when the registered mask already matches.
+  if (c->ev_known && c->ev_mask == ev) return;
   struct epoll_event e = { .events = ev, .data.fd = c->fd };
-  epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, c->fd, &e);
+  if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, c->fd, &e) == 0) {
+    c->ev_mask = ev;
+    c->ev_known = 1;
+  }
 }
 
 static __thread Conn *g_graveyard = NULL;  // closed conns, freed at shutdown (no UAF in the loop)
@@ -1964,7 +1974,10 @@ static int client_to_proxy(Conn *c) {
   }
   if (g_epoll_fd >= 0) {
     struct epoll_event e = { .events = EPOLLIN | EPOLLOUT | EPOLLRDHUP, .data.fd = bfd };
-    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, bfd, &e);
+    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, bfd, &e) == 0) {
+      b->ev_mask = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+      b->ev_known = 1;
+    }
   }
   if (c->in.len > 0) {
     buf_add(&c->c2b, c->in.data, c->in.len);
@@ -2153,7 +2166,10 @@ static int start_relay(Conn *c, const char *data, size_t len, int was_head) {
   buf_add(&b->out, data, len);
   if (g_epoll_fd >= 0) {
     struct epoll_event e = { .events = EPOLLIN | EPOLLOUT | EPOLLRDHUP, .data.fd = bfd };
-    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, bfd, &e);
+    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, bfd, &e) == 0) {
+      b->ev_mask = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+      b->ev_known = 1;
+    }
   }
   epoll_mod(c);
   epoll_mod(b);
@@ -2415,7 +2431,10 @@ static void server_loop(void) {
           Conn *c = conn_new(cfd, 0);
           if (c == NULL) { close(cfd); continue; }
           struct epoll_event e = { .events = EPOLLIN | EPOLLRDHUP, .data.fd = cfd };
-          epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, cfd, &e);
+          if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, cfd, &e) == 0) {
+            c->ev_mask = EPOLLIN | EPOLLRDHUP;
+            c->ev_known = 1;
+          }
         }
         continue;
       }
@@ -3225,7 +3244,7 @@ static napi_value js_start(napi_env env, napi_callback_info info) {
   g_cfg_blk_spin_us = env_int("FORGE_BLK_SPIN_US", 0, 0, 1000);
   g_cfg_blk_spin_maxconn = env_int("FORGE_BLK_SPIN_MAXCONN", 4, 0, 100000);
   g_cfg_rwlock = env_int("FORGE_STORE_RWLOCK", 0, 0, 1);
-  { const char *mm = getenv("FORGE_NATIVE_MODEL"); g_cfg_model = (mm != NULL && strcmp(mm, "epoll") == 0) ? 0 : 1; }
+  { const char *mm = getenv("FORGE_NATIVE_MODEL"); g_cfg_model = (mm != NULL && strcmp(mm, "blocking") == 0) ? 1 : 0; }
   if (g_cfg_model == 1) {
     // Blocking thread-per-connection model: one shared listener + acceptor.
     int port = 0;
@@ -3338,13 +3357,22 @@ static napi_value js_start(napi_env env, napi_callback_info info) {
 
   g_running = 1;
   g_nworkers = 0;
+  // RONDE 6: loop workers get the same 1 MiB stack as exp5's connection
+  // threads (deepest epoll-path frame is drain_into's 64 KiB buffer; the
+  // handler works on heap Bufs) — small stacks keep the pod's VA footprint
+  // flat; the workers are long-lived, so this is hygiene, not a spawn saving.
+  pthread_attr_t wattr;
+  pthread_attr_init(&wattr);
+  pthread_attr_setstacksize(&wattr, 1 << 20);
   for (int i = 0; i < nw; i++) {
-    if (pthread_create(&g_threads[i], NULL, server_thread_main, &g_boots[i]) != 0) {
+    if (pthread_create(&g_threads[i], &wattr, server_thread_main, &g_boots[i]) != 0) {
+      pthread_attr_destroy(&wattr);
       napi_throw_error(env, NULL, "native server: thread failed");
       return NULL;
     }
     g_nworkers++;
   }
+  pthread_attr_destroy(&wattr);
   napi_value out;
   napi_create_int32(env, port, &out);
   return out;
