@@ -1643,7 +1643,7 @@ static int g_cfg_quickack_recv = 0;  // FORGE_QUICKACK_RECV (0/1/2): re-set TCP_
 static int g_cfg_waitall = 1;        // FORGE_WAITALL (0/1): body-completion recv (MSG_WAITALL sized to the missing bytes) in the blocking loop — DEFAULT ON since RONDE 2 (A/B pod: faster paired 4/4 workloads vs off; git POSTs arrive in 2 segments = 2 recvs, audit counted +94 recvs over the clone phase)
 static int g_cfg_busy_poll_us = 0;   // FORGE_BUSY_POLL_US (0=off): SO_BUSY_POLL on accepted sockets
 static int g_cfg_model = 1;     // FORGE_NATIVE_MODEL: 1 = blocking thread-per-connection (DEFAULT since PENGGALIAN CELAH 2: won the standard-ruler per-workload A/B vs epoll), 0 = epoll workers (FORGE_NATIVE_MODEL=epoll)
-static int g_cfg_stpool = 0;    // FORGE_NATIVE_STPOOL (0=off, else N standing connection-affinity workers; RONDE 3 lever 1)
+static int g_cfg_stpool = 0;    // FORGE_NATIVE_STPOOL (0=off, else N standing connection-affinity workers; RONDE 3 lever 1; DEFAULT ON N=128 in the exp3s STPOOL-resubmit variant — env_int default below)
 static int g_cfg_blk_spin_us = 0;      // FORGE_BLK_SPIN_US (0=off): adaptive spin before the blocking recv (RONDE 3 lever 2)
 static int g_cfg_blk_spin_maxconn = 4; // FORGE_BLK_SPIN_MAXCONN: spin only while blocking serves in flight <= this
 
@@ -3211,7 +3211,7 @@ static napi_value js_start(napi_env env, napi_callback_info info) {
   g_cfg_busy_poll_us = env_int("FORGE_BUSY_POLL_US", 0, 0, 1000);
   g_cfg_pool = env_int("FORGE_NATIVE_POOL", 0, 0, MAX_POOL_WORKERS);
   g_cfg_pool_idle_ms = env_int("FORGE_NATIVE_POOL_IDLE_MS", 5, 0, 1000);
-  g_cfg_stpool = env_int("FORGE_NATIVE_STPOOL", 0, 0, MAX_STPOOL_WORKERS);
+  g_cfg_stpool = env_int("FORGE_NATIVE_STPOOL", 128, 0, MAX_STPOOL_WORKERS);
   g_cfg_blk_spin_us = env_int("FORGE_BLK_SPIN_US", 0, 0, 1000);
   g_cfg_blk_spin_maxconn = env_int("FORGE_BLK_SPIN_MAXCONN", 4, 0, 100000);
   g_cfg_rwlock = env_int("FORGE_STORE_RWLOCK", 0, 0, 1);
