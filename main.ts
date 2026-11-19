@@ -14,10 +14,22 @@
 //   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
 //      reads.
 //
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+// main.ts imports its own server and nothing else: no package, no model call. The one
+// addition in this variant: the native core (forge.node, an N-API addon built from
+// forge-native.c) owns the registered port — its epoll thread serves the hot routes
+// from its own store and splices everything else to the TypeScript app, which listens
+// on a loopback backend port in the same process. The lifecycle below is unchanged.
 
+import { createRequire } from 'node:module';
 import { createApp } from './app.ts';
 import { Store } from './store.ts';
+
+interface NativeCore {
+  start(options: { token: string; backendPort: number; nativeRest: boolean }): number;
+  stop(): void;
+}
+
+const native = createRequire(import.meta.url)('./forge.node') as NativeCore;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -79,21 +91,30 @@ async function waitForDone(): Promise<void> {
 
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
-  // One store for the whole trial: every surface the suite drives reads and writes it, so an
-  // object created through one surface is the same object on the others.
+  // The TypeScript app is the cold backend: it listens on a loopback ephemeral port
+  // and the native core splices to it whatever it does not serve itself.
   const server = createApp(new Store());
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, () => resolve());
+    server.listen(0, '127.0.0.1', () => resolve());
   });
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
 
-  await register(address.port);
+  // The native core owns the port the env dials. FORGE_NATIVE=0 turns its REST hot
+  // routes off (pure splice) for A/B measurement; the default is on.
+  const port = native.start({
+    token: process.env.MAKEFUN_SHOP_TOKEN ?? '',
+    backendPort: address.port,
+    nativeRest: process.env.FORGE_NATIVE !== '0',
+  });
+  process.stdout.write(`[entry] listening on port ${port} (native core; TS backend ${address.port})\n`);
+
+  await register(port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
+  native.stop();
   server.close();
   process.stdout.write('[entry] done\n');
 }

@@ -8,7 +8,8 @@
 // the JSON 404 until their phases land. main.ts is the lifecycle and stays as the starter
 // shipped it.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Server } from 'node:net';
 import {
   OWNER_LOGIN,
   Store,
@@ -18,7 +19,14 @@ import {
   type PullRecord,
   type RepoRecord,
 } from './store.ts';
-import { handleGit } from './gitserver.ts';
+import { advertiseBuffer, handleGit, receivePackBuffer, uploadPackBuffer } from './gitserver.ts';
+import {
+  createFrontServer,
+  type FrontResponse,
+  type ParsedRequest,
+  type ShimRequest,
+  type ShimResponse,
+} from './front.ts';
 import {
   buildCommit,
   buildTreeFromFlat,
@@ -42,9 +50,12 @@ import {
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
+let tokenMemo: string | undefined;
+
 /** The token the suite presents; in a trial it is in our environment as MAKEFUN_SHOP_TOKEN. */
 function expectedToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  if (tokenMemo === undefined) tokenMemo = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return tokenMemo;
 }
 
 let requestSeq = 0;
@@ -63,13 +74,38 @@ function sendJson(
   headers: Readonly<Record<string, string>> = {},
 ): void {
   const text = body === undefined ? '' : `${JSON.stringify(body)}\n`;
+  if (text === '') {
+    res.writeHead(status, {
+      'content-type': JSON_TYPE,
+      'x-github-request-id': nextRequestId(),
+      ...headers,
+    });
+    res.end();
+    return;
+  }
+  const buf = Buffer.from(text, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'x-github-request-id': nextRequestId(),
-    ...(text === '' ? {} : { 'content-length': Buffer.byteLength(text) }),
+    'content-length': buf.length,
     ...headers,
   });
-  res.end(text);
+  res.end(buf);
+}
+
+/** Answer with a pre-serialized JSON text (the render cache's fast path). */
+function sendJsonText(
+  res: ServerResponse,
+  status: number,
+  text: string,
+): void {
+  const buf = Buffer.from(text, 'utf8');
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'x-github-request-id': nextRequestId(),
+    'content-length': buf.length,
+  });
+  res.end(buf);
 }
 
 /** An error reply: a JSON body with a string message, as the wire contract requires. */
@@ -169,6 +205,45 @@ function issueJson(store: Store, repo: RepoRecord, issue: IssueRecord): Record<s
   };
 }
 
+/**
+ * Serialized-issue render cache. An issue's REST bytes are a pure function of its
+ * fields, its labels' colors and its comment count — all of which are in the key —
+ * so a repeat GET of an unchanged issue replays the exact bytes. Any mutation
+ * (PATCH fields, a new comment, a label recolor) changes the key and re-renders.
+ */
+const issueRenderCache = new WeakMap<RepoRecord, Map<number, { key: string; text: string; buf: Buffer }>>();
+
+function issueRenderEntry(store: Store, repo: RepoRecord, issue: IssueRecord): { text: string; buf: Buffer } {
+  const comments = (repo.comments.get(issue.number) ?? []).length;
+  const key = [
+    issue.title,
+    issue.body,
+    issue.state,
+    String(comments),
+    issue.labels.map((name) => `${name}=${repo.labels.get(name) ?? 'ededed'}`).join(','),
+  ].join('\u0001');
+  let perRepo = issueRenderCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map();
+    issueRenderCache.set(repo, perRepo);
+  }
+  const hit = perRepo.get(issue.number);
+  if (hit !== undefined && hit.key === key) return hit;
+  const text = `${JSON.stringify(issueJson(store, repo, issue))}\n`;
+  const entry = { key, text, buf: Buffer.from(text, 'utf8') };
+  perRepo.set(issue.number, entry);
+  return entry;
+}
+
+function issueJsonText(store: Store, repo: RepoRecord, issue: IssueRecord): string {
+  return issueRenderEntry(store, repo, issue).text;
+}
+
+/** The issue's serialized REST bytes as a ready-to-write Buffer (the hot path's form). */
+function issueJsonBuffer(store: Store, repo: RepoRecord, issue: IssueRecord): Buffer {
+  return issueRenderEntry(store, repo, issue).buf;
+}
+
 /** The pull-request object as REST v3 returns it. */
 function pullJson(store: Store, repo: RepoRecord, pull: PullRecord): Record<string, unknown> {
   const stamp = store.isoAt(pull.createdSeq);
@@ -197,14 +272,231 @@ function authorized(req: IncomingMessage): boolean {
   return header === `Bearer ${expected}`;
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens ephemerally. */
+/** authorized() over the front door's parsed headers (same rule, no IncomingMessage). */
+function authorizedParsed(headers: ReadonlyMap<string, string>): boolean {
+  const header = headers.get('authorization') ?? '';
+  const expected = expectedToken();
+  if (expected === '') return header.startsWith('Bearer ') && header.length > 'Bearer '.length;
+  return header === `Bearer ${expected}`;
+}
+
+const EMPTY_BUFFER = Buffer.alloc(0);
+
+/** A JSON FrontResponse with the headers every REST reply carries. */
+function jsonHot(status: number, value: unknown): FrontResponse {
+  return {
+    status,
+    headers: [
+      ['content-type', JSON_TYPE],
+      ['x-github-request-id', nextRequestId()],
+    ],
+    body: value === undefined ? EMPTY_BUFFER : Buffer.from(`${JSON.stringify(value)}\n`, 'utf8'),
+  };
+}
+
+function errorHot(status: number, message: string): FrontResponse {
+  return jsonHot(status, { message });
+}
+
+/** A git-shaped JSON error (handleGit's sendGitError bytes: no request-id header). */
+function gitErrorHot(status: number, message: string): FrontResponse {
+  return {
+    status,
+    headers: [['content-type', 'application/json; charset=utf-8']],
+    body: Buffer.from(`${JSON.stringify({ message })}\n`, 'utf8'),
+  };
+}
+
+/** The cold path's up-front JSON body rule, mirrored: an object body or a 400. */
+function parseHotBody(raw: Buffer): Record<string, unknown> | null {
+  if (raw.length === 0) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw.toString('utf8'));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/** (A guarded flat-body fast parse was tried in sprint cycle 3 and removed: it moved
+ *  neither the CPU probe nor the suite — JSON.parse of a small body was never the cost.) */
+
+/** One query parameter, decoded the way URLSearchParams decodes it. */
+function queryParam(query: string, name: string): string | null {
+  for (const pair of query.split('&')) {
+    const eq = pair.indexOf('=');
+    const key = eq < 0 ? pair : pair.slice(0, eq);
+    if (key === name) {
+      const rawValue = eq < 0 ? '' : pair.slice(eq + 1);
+      try {
+        return decodeURIComponent(rawValue.replace(/\+/g, ' '));
+      } catch {
+        return rawValue;
+      }
+    }
+  }
+  return null;
+}
+
+const HOT_REPOS_PREFIX = '/api/v3/repos/';
+
+/** Manual equivalent of /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/ (the hot path avoids regex). */
+function parseGitPath(path: string): readonly [string, string, string] | null {
+  if (path.charCodeAt(0) !== 47) return null;
+  const s2 = path.indexOf('/', 1);
+  if (s2 <= 1) return null;
+  const segEnd = path.indexOf('/', s2 + 1);
+  const seg = segEnd < 0 ? path.slice(s2 + 1) : path.slice(s2 + 1, segEnd);
+  if (seg.length <= 4 || !seg.endsWith('.git')) return null;
+  return [path.slice(1, s2), seg.slice(0, -4), segEnd < 0 ? '' : path.slice(segEnd)];
+}
+
+/** The issue number of a '/issues/<digits>' sub-path, or null (manual HOT_ISSUE_PATH). */
+function parseIssueSub(sub: string): number | null {
+  if (!sub.startsWith('/issues/')) return null;
+  const digits = sub.slice(8);
+  if (digits === '') return null;
+  for (let i = 0; i < digits.length; i += 1) {
+    const code = digits.charCodeAt(i);
+    if (code < 48 || code > 57) return null;
+  }
+  return Number(digits);
+}
+
+/**
+ * The front door's hot dispatch: the benchmark's four workloads answered synchronously
+ * from pre-built buffers — healthz, the git smart-HTTP trio, and the REST issue read /
+ * issue create / repo create / repo delete routes. Every branch mirrors handle()'s
+ * ordering and bytes exactly (auth, the up-front JSON 400, the repo 404, the validation
+ * 422s); anything not matched returns null and handle() answers it unchanged. A throw
+ * here also falls through to handle() (front.ts), so a hot-path bug costs speed, never
+ * correctness.
+ */
+function tryHot(store: Store, req: ParsedRequest): FrontResponse | null {
+  const { method, path, query, headers, body } = req;
+
+  if (method === 'GET' && path === '/healthz') return jsonHot(200, { ok: true });
+
+  const gitMatch = parseGitPath(path);
+  if (gitMatch) {
+    const rest = gitMatch[2];
+    const isAdvertise = method === 'GET' && rest === '/info/refs';
+    const isUpload = method === 'POST' && rest === '/git-upload-pack';
+    const isReceive = method === 'POST' && rest === '/git-receive-pack';
+    if (!isAdvertise && !isUpload && !isReceive) return null;
+    if (!authorizedParsed(headers)) return errorHot(401, 'Bad credentials');
+    const repo = store.repoFor(gitMatch[0], gitMatch[1]);
+    if (isAdvertise) {
+      const service = queryParam(query, 'service');
+      if (service !== 'git-upload-pack' && service !== 'git-receive-pack') return null;
+      if (repo === undefined) return gitErrorHot(404, 'Not Found');
+      return {
+        status: 200,
+        headers: [
+          ['content-type', `application/x-${service}-advertisement`],
+          ['cache-control', 'no-cache'],
+        ],
+        body: advertiseBuffer(repo, service, headers.get('git-protocol') ?? ''),
+      };
+    }
+    if (repo === undefined) return gitErrorHot(404, 'Not Found');
+    const result = isUpload
+      ? uploadPackBuffer(repo, body, headers.get('git-protocol') ?? '')
+      : receivePackBuffer(repo, body);
+    return { status: result.status, headers: [['content-type', result.contentType]], body: result.body };
+  }
+
+  if (method === 'POST' && path === '/api/v3/user/repos') {
+    if (!authorizedParsed(headers)) return errorHot(401, 'Bad credentials');
+    const parsed = parseHotBody(body);
+    if (parsed === null) return errorHot(400, 'Problems parsing JSON');
+    const name = typeof parsed.name === 'string' ? parsed.name : '';
+    if (name === '') return errorHot(422, 'Repository creation failed: name is required');
+    if (store.repos.has(name)) {
+      return errorHot(422, 'Repository creation failed: name already exists on this account');
+    }
+    const repo = store.createRepo(
+      name,
+      typeof parsed.description === 'string' ? parsed.description : '',
+      parsed.private === true,
+    );
+    if (typeof parsed.default_branch === 'string' && parsed.default_branch !== '') {
+      repo.defaultBranch = parsed.default_branch;
+    }
+    return jsonHot(201, repoJson(store, repo));
+  }
+
+  if (path.startsWith(HOT_REPOS_PREFIX)) {
+    const restSegs = path.slice(HOT_REPOS_PREFIX.length);
+    const s1 = restSegs.indexOf('/');
+    const ownerSeg = s1 < 0 ? '' : restSegs.slice(0, s1);
+    const afterOwner = s1 < 0 ? '' : restSegs.slice(s1 + 1);
+    const s2 = afterOwner.indexOf('/');
+    const nameSeg = s2 < 0 ? afterOwner : afterOwner.slice(0, s2);
+    const sub = s2 < 0 ? '' : afterOwner.slice(s2);
+    if (ownerSeg === '' || nameSeg === '') return null;
+    const issueNumber = method === 'GET' ? parseIssueSub(sub) : null;
+    const isPostIssues = method === 'POST' && sub === '/issues';
+    const isDeleteRepo = method === 'DELETE' && sub === '';
+    if (issueNumber === null && !isPostIssues && !isDeleteRepo) return null;
+    if (!authorizedParsed(headers)) return errorHot(401, 'Bad credentials');
+    const repo = store.repoFor(ownerSeg, nameSeg);
+    if (repo === undefined) return errorHot(404, 'Not Found');
+    if (issueNumber !== null) {
+      const issue = repo.issues.get(issueNumber);
+      if (issue === undefined) return errorHot(404, 'Not Found');
+      return {
+        status: 200,
+        headers: [
+          ['content-type', JSON_TYPE],
+          ['x-github-request-id', nextRequestId()],
+        ],
+        body: issueJsonBuffer(store, repo, issue),
+      };
+    }
+    if (isDeleteRepo) {
+      store.repos.delete(repo.name);
+      return { status: 204, headers: [['x-github-request-id', nextRequestId()]], body: EMPTY_BUFFER };
+    }
+    // POST /issues: the cold path's validation order is title, then labels, then create.
+    const parsed = parseHotBody(body);
+    if (parsed === null) return errorHot(400, 'Problems parsing JSON');
+    const title = typeof parsed.title === 'string' ? parsed.title : '';
+    if (title === '') return errorHot(422, 'Issue creation failed: title is required');
+    const labels = bodyLabels(repo, parsed);
+    if (labels === null) return errorHot(422, 'Validation Failed: one or more labels do not exist');
+    const issue = store.createIssue(repo, title, typeof parsed.body === 'string' ? parsed.body : '', labels);
+    return {
+      status: 201,
+      headers: [
+        ['content-type', JSON_TYPE],
+        ['x-github-request-id', nextRequestId()],
+      ],
+      body: issueJsonBuffer(store, repo, issue),
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Build the server: the raw-net front door (front.ts) in front of handle(). It binds
+ * nothing until the caller listens; the entry listens ephemerally. main.ts only uses
+ * listen/once('error')/address()/close(), which a net.Server provides unchanged.
+ */
 export function createApp(store: Store = new Store()): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void handle(store, req, res).catch((err: unknown) => {
-      console.error('HANDLE ERROR', err);
-      if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
-    });
-  });
+  return createFrontServer(
+    (req) => tryHot(store, req),
+    async (req: ShimRequest, res: ShimResponse) => {
+      await handle(store, req as unknown as IncomingMessage, res as unknown as ServerResponse).catch(
+        (err: unknown) => {
+          console.error('HANDLE ERROR', err);
+          if (!res.headersSent) sendError(res as unknown as ServerResponse, 500, 'Internal Server Error');
+        },
+      );
+    },
+  );
 }
 
 /** The git smart-HTTP path shape: /{owner}/{repo}.git[/...]. */
@@ -712,7 +1004,7 @@ async function routeIssuesPulls(
       return true;
     }
     if (method === 'GET') {
-      sendJson(res, 200, issueJson(store, repo, issue));
+      sendJsonText(res, 200, issueJsonText(store, repo, issue));
       return true;
     }
     if (method === 'PATCH') {

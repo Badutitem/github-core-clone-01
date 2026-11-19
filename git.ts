@@ -177,6 +177,30 @@ export function buildCommit(
   return storeObject(repo, 'commit', Buffer.from(`${lines.join('\n')}\n${fields.message}`, 'utf8'));
 }
 
+/**
+ * Parsed-commit cache: commit objects are immutable, so a commit's parsed view never
+ * changes once stored. Graph walks (ancestry, reachability, shallow planning) re-parse
+ * the same commits on every push/fetch without this — the cache turns them into Map
+ * lookups. Keyed by repo so a dropped repo takes its views with it.
+ */
+const commitViews = new WeakMap<RepoRecord, Map<string, CommitView>>();
+
+/** The parsed view of a stored commit, or undefined when the oid is not a commit here. */
+export function commitView(repo: RepoRecord, oid: string): CommitView | undefined {
+  let cache = commitViews.get(repo);
+  if (cache === undefined) {
+    cache = new Map();
+    commitViews.set(repo, cache);
+  }
+  const hit = cache.get(oid);
+  if (hit !== undefined) return hit;
+  const object = getObject(repo, oid);
+  if (object === undefined || object.type !== 'commit') return undefined;
+  const view = parseCommit(object.data);
+  cache.set(oid, view);
+  return view;
+}
+
 /** The commit at a ref (branch name or full ref), or undefined when unborn/unknown. */
 export function refTip(repo: RepoRecord, ref: string): string | undefined {
   return repo.refs.get(ref);
@@ -237,8 +261,9 @@ export function commitPaths(
 ): string {
   const tip = repo.refs.get(branchRef);
   const tipCommit = tip !== undefined ? getObject(repo, tip) : undefined;
-  const files = tipCommit !== undefined && tipCommit.type === 'commit'
-    ? flattenTree(repo, parseCommit(tipCommit.data).tree)
+  const tipView = tip !== undefined ? commitView(repo, tip) : undefined;
+  const files = tipView !== undefined
+    ? flattenTree(repo, tipView.tree)
     : new Map<string, string>();
   for (const [path, content] of changes) {
     if (content === null) files.delete(path);
@@ -267,10 +292,10 @@ export function ancestorsOf(repo: RepoRecord, tip: string): Set<string> {
   while (queue.length > 0) {
     const oid = queue.pop() as string;
     if (seen.has(oid)) continue;
-    const object = getObject(repo, oid);
-    if (object === undefined || object.type !== 'commit') continue;
+    const view = commitView(repo, oid);
+    if (view === undefined) continue;
     seen.add(oid);
-    for (const parent of parseCommit(object.data).parents) queue.push(parent);
+    for (const parent of view.parents) queue.push(parent);
   }
   return seen;
 }
@@ -285,9 +310,9 @@ export function isAncestor(repo: RepoRecord, ancestor: string, descendant: strin
     if (oid === ancestor) return true;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const object = getObject(repo, oid);
-    if (object === undefined || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) queue.push(parent);
+    const view = commitView(repo, oid);
+    if (view === undefined) continue;
+    for (const parent of view.parents) queue.push(parent);
   }
   return false;
 }
@@ -302,9 +327,9 @@ export function mergeBase(repo: RepoRecord, a: string, b: string): string | unde
     if (ancestors.has(oid)) return oid;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const object = getObject(repo, oid);
-    if (object === undefined || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) queue.push(parent);
+    const view = commitView(repo, oid);
+    if (view === undefined) continue;
+    for (const parent of view.parents) queue.push(parent);
   }
   return undefined;
 }
@@ -376,7 +401,7 @@ export function collectReachable(repo: RepoRecord, roots: Iterable<string>): Set
     if (object === undefined) continue;
     seen.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
+      const commit = commitView(repo, oid) as CommitView;
       queue.push(commit.tree);
       for (const parent of commit.parents) queue.push(parent);
     } else if (object.type === 'tag') {
@@ -402,7 +427,7 @@ export function closureComplete(repo: RepoRecord, roots: Iterable<string>): bool
     if (object === undefined) return false;
     seen.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
+      const commit = commitView(repo, oid) as CommitView;
       queue.push(commit.tree);
       for (const parent of commit.parents) queue.push(parent);
     } else if (object.type === 'tag') {
@@ -456,10 +481,9 @@ export function depthLimited(repo: RepoRecord, wants: readonly string[], depth: 
     const known = generations.get(oid);
     if (known !== undefined && known <= gen) continue;
     generations.set(oid, gen);
-    const object = getObject(repo, oid);
-    if (object === undefined || object.type !== 'commit') continue;
+    const commit = commitView(repo, oid);
+    if (commit === undefined) continue;
     objects.add(oid);
-    const commit = parseCommit(object.data);
     addTreeClosure(commit.tree);
     const parents = commit.parents;
     if (gen >= depth) {

@@ -64,6 +64,20 @@ function refsFingerprint(repo: RepoRecord): string {
   return parts.join('|');
 }
 
+/**
+ * A fast-path cache key for one raw git request body. A fetch or ls-refs response is a
+ * pure function of the request bytes plus the repo's ref positions and object count
+ * (objects are content-addressed and never mutate; any ingest grows the count, any
+ * ref move changes the fingerprint), so an identical body under an identical key
+ * replays byte-exactly without packet decoding or argument parsing.
+ */
+import { createHash } from 'node:crypto';
+
+function rawBodyKey(repo: RepoRecord, kind: string, raw: Buffer): string {
+  const digest = createHash('sha1').update(raw).digest('hex');
+  return `${kind}|raw|${refsFingerprint(repo)}|${repo.objects.size}|${digest}`;
+}
+
 /** The protocol-v2 advertisement carries no repo data at all: build it once. */
 const V2_ADVERTISEMENT: Buffer = Buffer.concat([
   pktLine('version 2\n'),
@@ -89,6 +103,22 @@ function sendGitError(res: ServerResponse, status: number, message: string): voi
   const text = `${JSON.stringify({ message })}\n`;
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(text);
+}
+
+/** A complete git response as bytes: the buffer core the front door's hot path writes
+ *  directly, and handleGit below adapts onto ServerResponse for the cold path. */
+export interface GitBufferResult {
+  readonly status: number;
+  readonly contentType: string;
+  readonly body: Buffer;
+}
+
+function gitJsonError(status: number, message: string): GitBufferResult {
+  return {
+    status,
+    contentType: 'application/json; charset=utf-8',
+    body: Buffer.from(`${JSON.stringify({ message })}\n`, 'utf8'),
+  };
 }
 
 /** Handle one git smart-HTTP request. True when the request was answered here. */
@@ -140,23 +170,13 @@ function headTarget(repo: RepoRecord): string {
   return `refs/heads/${repo.defaultBranch}`;
 }
 
-function advertise(req: IncomingMessage, res: ServerResponse, repo: RepoRecord, service: string): void {
-  const wantsV2 = service === 'git-upload-pack'
-    && (req.headers['git-protocol'] ?? '').includes('version=2');
-  res.writeHead(200, {
-    'content-type': `application/x-${service}-advertisement`,
-    'cache-control': 'no-cache',
-  });
-  if (wantsV2) {
-    res.end(V2_ADVERTISEMENT);
-    return;
-  }
+/** The advertisement body for one service (v2's is a module constant; v0's is cached). */
+export function advertiseBuffer(repo: RepoRecord, service: string, gitProtocol: string): Buffer {
+  const wantsV2 = service === 'git-upload-pack' && gitProtocol.includes('version=2');
+  if (wantsV2) return V2_ADVERTISEMENT;
   const key = `advertise|${service}|${refsFingerprint(repo)}`;
   const cached = cacheGet(repo, key);
-  if (cached !== undefined) {
-    res.end(cached);
-    return;
-  }
+  if (cached !== undefined) return cached;
   const caps = service === 'git-upload-pack'
     ? `multi_ack_detailed side-band-64k thin-pack ofs-delta shallow symref=HEAD:${headTarget(repo)} agent=${AGENT}`
     : `report-status side-band-64k delete-refs ofs-delta agent=${AGENT}`;
@@ -176,7 +196,15 @@ function advertise(req: IncomingMessage, res: ServerResponse, repo: RepoRecord, 
   parts.push(pktFlush());
   const body = Buffer.concat(parts);
   cacheSet(repo, key, body);
-  res.end(body);
+  return body;
+}
+
+function advertise(req: IncomingMessage, res: ServerResponse, repo: RepoRecord, service: string): void {
+  res.writeHead(200, {
+    'content-type': `application/x-${service}-advertisement`,
+    'cache-control': 'no-cache',
+  });
+  res.end(advertiseBuffer(repo, service, req.headers['git-protocol'] ?? ''));
 }
 
 // --------------------------------------------------------------------------- ls-refs (v2)
@@ -187,15 +215,11 @@ interface LsRefsArgs {
   readonly prefixes: string[];
 }
 
-/** One ls-refs response: HEAD (prefix permitting) then the matching refs, peeled on request. */
-function lsRefs(res: ServerResponse, repo: RepoRecord, args: LsRefsArgs): void {
+/** One ls-refs response body: HEAD (prefix permitting) then the matching refs, peeled on request. */
+function lsRefsBuffer(repo: RepoRecord, args: LsRefsArgs): Buffer {
   const key = `lsrefs|${refsFingerprint(repo)}|${args.peel ? 1 : 0}|${args.symrefs ? 1 : 0}|${args.prefixes.join(' ')}`;
   const cached = cacheGet(repo, key);
-  if (cached !== undefined) {
-    res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result' });
-    res.end(cached);
-    return;
-  }
+  if (cached !== undefined) return cached;
   const matches = (name: string): boolean =>
     args.prefixes.length === 0 || args.prefixes.some((prefix) => name.startsWith(prefix));
   const parts: Buffer[] = [];
@@ -216,8 +240,7 @@ function lsRefs(res: ServerResponse, repo: RepoRecord, args: LsRefsArgs): void {
   parts.push(pktFlush());
   const body = Buffer.concat(parts);
   cacheSet(repo, key, body);
-  res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result' });
-  res.end(body);
+  return body;
 }
 
 // --------------------------------------------------------------------------- fetch
@@ -281,9 +304,15 @@ function sidebandPackets(pack: Buffer): Buffer[] {
   return packets;
 }
 
-async function uploadPack(req: IncomingMessage, res: ServerResponse, repo: RepoRecord): Promise<void> {
-  const raw = await readBody(req);
-  const v2 = (req.headers['git-protocol'] ?? '').includes('version=2');
+const UPLOAD_RESULT_TYPE = 'application/x-git-upload-pack-result';
+
+/** The upload-pack exchange over a raw request body (ls-refs or fetch, v2 or v0). */
+export function uploadPackBuffer(repo: RepoRecord, raw: Buffer, gitProtocol: string): GitBufferResult {
+  // Fast path: an identical body under identical repo state replays byte-exactly.
+  const fastKey = rawBodyKey(repo, 'up', raw);
+  const fastHit = cacheGet(repo, fastKey);
+  if (fastHit !== undefined) return { status: 200, contentType: UPLOAD_RESULT_TYPE, body: fastHit };
+  const v2 = gitProtocol.includes('version=2');
   const { packets } = decodePackets(raw);
   const lines = packets
     .filter((packet) => packet.kind === 'data')
@@ -300,21 +329,15 @@ async function uploadPack(req: IncomingMessage, res: ServerResponse, repo: RepoR
         else if (line === 'symrefs') symrefs = true;
         else if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
       }
-      lsRefs(res, repo, { peel, symrefs, prefixes });
-      return;
+      const lsBody = lsRefsBuffer(repo, { peel, symrefs, prefixes });
+      cacheSet(repo, fastKey, lsBody);
+      return { status: 200, contentType: UPLOAD_RESULT_TYPE, body: lsBody };
     }
-    if (command !== 'command=fetch') {
-      sendGitError(res, 400, 'Bad Request');
-      return;
-    }
+    if (command !== 'command=fetch') return gitJsonError(400, 'Bad Request');
     const args = parseFetchArgs(lines);
     const key = fetchCacheKey(2, args);
     const cached = cacheGet(repo, key);
-    if (cached !== undefined) {
-      res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result' });
-      res.end(cached);
-      return;
-    }
+    if (cached !== undefined) return { status: 200, contentType: UPLOAD_RESULT_TYPE, body: cached };
     const plan = planFetch(repo, args);
     const pack = packOf(repo, plan.objects);
     const parts: Buffer[] = [pktLine('acknowledgments\n')];
@@ -334,9 +357,8 @@ async function uploadPack(req: IncomingMessage, res: ServerResponse, repo: RepoR
     parts.push(pktLine('packfile\n'), ...sidebandPackets(pack), pktFlush());
     const body = Buffer.concat(parts);
     cacheSet(repo, key, body);
-    res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result' });
-    res.end(body);
-    return;
+    cacheSet(repo, fastKey, body);
+    return { status: 200, contentType: UPLOAD_RESULT_TYPE, body };
   }
 
   // v0: wants in the first section, haves + done after the flush — decode in two rounds.
@@ -345,18 +367,11 @@ async function uploadPack(req: IncomingMessage, res: ServerResponse, repo: RepoR
   const allLines = [...first.packets, ...second.packets]
     .filter((packet) => packet.kind === 'data')
     .map((packet) => (packet.kind === 'data' ? packet.payload.toString('utf8').replace(/\n$/, '') : ''));
-  if (!allLines.some((line) => line.startsWith('want '))) {
-    sendGitError(res, 400, 'Bad Request');
-    return;
-  }
+  if (!allLines.some((line) => line.startsWith('want '))) return gitJsonError(400, 'Bad Request');
   const args = parseFetchArgs(allLines);
   const key = fetchCacheKey(0, args);
   const cached = cacheGet(repo, key);
-  if (cached !== undefined) {
-    res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result' });
-    res.end(cached);
-    return;
-  }
+  if (cached !== undefined) return { status: 200, contentType: UPLOAD_RESULT_TYPE, body: cached };
   const plan = planFetch(repo, args);
   const pack = packOf(repo, plan.objects);
   const parts: Buffer[] = [];
@@ -367,8 +382,15 @@ async function uploadPack(req: IncomingMessage, res: ServerResponse, repo: RepoR
   parts.push(...sidebandPackets(pack), pktFlush());
   const body = Buffer.concat(parts);
   cacheSet(repo, key, body);
-  res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result' });
-  res.end(body);
+  cacheSet(repo, fastKey, body);
+  return { status: 200, contentType: UPLOAD_RESULT_TYPE, body };
+}
+
+async function uploadPack(req: IncomingMessage, res: ServerResponse, repo: RepoRecord): Promise<void> {
+  const raw = await readBody(req);
+  const result = uploadPackBuffer(repo, raw, req.headers['git-protocol'] ?? '');
+  res.writeHead(result.status, { 'content-type': result.contentType });
+  res.end(result.body);
 }
 
 /** want/have/shallow/deepen/done lines (v2 argument lines or v0 lines) -> fetch arguments. */
@@ -396,8 +418,8 @@ interface PushCommand {
   readonly ref: string;
 }
 
-async function receivePack(req: IncomingMessage, res: ServerResponse, repo: RepoRecord): Promise<void> {
-  const raw = await readBody(req);
+/** The receive-pack exchange over a raw request body (commands + pack -> report-status). */
+export function receivePackBuffer(repo: RepoRecord, raw: Buffer): GitBufferResult {
   const { packets, consumed } = decodePackets(raw);
   const commands: PushCommand[] = [];
   let capabilities: string[] = [];
@@ -418,10 +440,7 @@ async function receivePack(req: IncomingMessage, res: ServerResponse, repo: Repo
       });
     }
   }
-  if (commands.length === 0) {
-    sendGitError(res, 400, 'Bad Request');
-    return;
-  }
+  if (commands.length === 0) return gitJsonError(400, 'Bad Request');
 
   // Ingest the pack first: objects land even when a ref update is later refused (as in git).
   const packBytes = raw.subarray(consumed);
@@ -450,12 +469,17 @@ async function receivePack(req: IncomingMessage, res: ServerResponse, repo: Repo
   }
   report.push(pktFlush());
   const reportBytes = Buffer.concat(report);
-  res.writeHead(200, { 'content-type': 'application/x-git-receive-pack-result' });
-  if (capabilities.includes('side-band-64k')) {
-    res.end(Buffer.concat(sidebandPackets(reportBytes)));
-  } else {
-    res.end(reportBytes);
-  }
+  const body = capabilities.includes('side-band-64k')
+    ? Buffer.concat(sidebandPackets(reportBytes))
+    : reportBytes;
+  return { status: 200, contentType: 'application/x-git-receive-pack-result', body };
+}
+
+async function receivePack(req: IncomingMessage, res: ServerResponse, repo: RepoRecord): Promise<void> {
+  const raw = await readBody(req);
+  const result = receivePackBuffer(repo, raw);
+  res.writeHead(result.status, { 'content-type': result.contentType });
+  res.end(result.body);
 }
 
 /** Apply one ref update; null when applied, otherwise the report-status refusal reason. */
