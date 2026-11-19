@@ -1643,7 +1643,7 @@ static int g_cfg_quickack_recv = 0;  // FORGE_QUICKACK_RECV (0/1/2): re-set TCP_
 static int g_cfg_waitall = 1;        // FORGE_WAITALL (0/1): body-completion recv (MSG_WAITALL sized to the missing bytes) in the blocking loop — DEFAULT ON since RONDE 2 (A/B pod: faster paired 4/4 workloads vs off; git POSTs arrive in 2 segments = 2 recvs, audit counted +94 recvs over the clone phase)
 static int g_cfg_busy_poll_us = 0;   // FORGE_BUSY_POLL_US (0=off): SO_BUSY_POLL on accepted sockets
 static int g_cfg_model = 1;     // FORGE_NATIVE_MODEL: 1 = blocking thread-per-connection (DEFAULT since PENGGALIAN CELAH 2: won the standard-ruler per-workload A/B vs epoll), 0 = epoll workers (FORGE_NATIVE_MODEL=epoll)
-static int g_cfg_stpool = 0;    // FORGE_NATIVE_STPOOL (0=off, else N standing connection-affinity workers; RONDE 3 lever 1; DEFAULT ON N=128 in the exp3s STPOOL-resubmit variant — env_int default below)
+static int g_cfg_stpool = 0;    // FORGE_NATIVE_STPOOL (0=off, else N standing connection-affinity workers; RONDE 3 lever 1)
 static int g_cfg_blk_spin_us = 0;      // FORGE_BLK_SPIN_US (0=off): adaptive spin before the blocking recv (RONDE 3 lever 2)
 static int g_cfg_blk_spin_maxconn = 4; // FORGE_BLK_SPIN_MAXCONN: spin only while blocking serves in flight <= this
 
@@ -2631,6 +2631,16 @@ static pthread_t g_blk_acceptor;
 static BlkConn *g_blk_conns = NULL;
 static pthread_mutex_t g_blk_lock = PTHREAD_MUTEX_INITIALIZER;
 
+// RONDE 5 — small-stack attribute for per-connection threads. The shipped
+// model created every connection thread with the default 8 MiB stack; the
+// handler's largest frame is the 64 KiB recv buffer in blk_serve_conn and
+// everything deeper works on heap Bufs, so 1 MiB is >10x headroom (the same
+// size the STPOOL workers already run with). Cheaper thread creation in the
+// acceptor loop and less VA bookkeeping per connection; wakeup topology is
+// unchanged (still one blocking thread per connection, serve to close).
+static pthread_attr_t g_blk_thread_attr;
+static int g_blk_thread_attr_ready = 0;
+
 // Bounded worker pool (BUAT LEBIH CEPAT, lever 2): FORGE_NATIVE_POOL=N keeps N
 // worker threads instead of a thread per connection. The acceptor pushes each
 // accepted connection onto a FIFO; workers pop and serve. A worker never parks
@@ -3156,7 +3166,7 @@ static void *blk_accept_main(void *unused) {
       continue;
     }
     pthread_mutex_unlock(&g_blk_lock);
-    if (pthread_create(&bc->tid, NULL, blk_conn_main, bc) != 0) {
+    if (pthread_create(&bc->tid, g_blk_thread_attr_ready ? &g_blk_thread_attr : NULL, blk_conn_main, bc) != 0) {
       pthread_mutex_lock(&g_blk_lock);
       BlkConn **pp = &g_blk_conns;
       while (*pp != NULL && *pp != bc) pp = &(*pp)->next;
@@ -3211,7 +3221,7 @@ static napi_value js_start(napi_env env, napi_callback_info info) {
   g_cfg_busy_poll_us = env_int("FORGE_BUSY_POLL_US", 0, 0, 1000);
   g_cfg_pool = env_int("FORGE_NATIVE_POOL", 0, 0, MAX_POOL_WORKERS);
   g_cfg_pool_idle_ms = env_int("FORGE_NATIVE_POOL_IDLE_MS", 5, 0, 1000);
-  g_cfg_stpool = env_int("FORGE_NATIVE_STPOOL", 128, 0, MAX_STPOOL_WORKERS);
+  g_cfg_stpool = env_int("FORGE_NATIVE_STPOOL", 0, 0, MAX_STPOOL_WORKERS);
   g_cfg_blk_spin_us = env_int("FORGE_BLK_SPIN_US", 0, 0, 1000);
   g_cfg_blk_spin_maxconn = env_int("FORGE_BLK_SPIN_MAXCONN", 4, 0, 100000);
   g_cfg_rwlock = env_int("FORGE_STORE_RWLOCK", 0, 0, 1);
@@ -3257,6 +3267,11 @@ static napi_value js_start(napi_env env, napi_callback_info info) {
       }
       pthread_attr_destroy(&attr);
       if (g_stp_nworkers == 0) g_cfg_stpool = 0;  // unavailable: per-connection threads
+    }
+    if (!g_blk_thread_attr_ready) {
+      pthread_attr_init(&g_blk_thread_attr);
+      pthread_attr_setstacksize(&g_blk_thread_attr, 1 << 20);
+      g_blk_thread_attr_ready = 1;
     }
     if (pthread_create(&g_blk_acceptor, NULL, blk_accept_main, NULL) != 0) {
       g_running = 0;
